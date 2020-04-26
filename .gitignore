@@ -4,6 +4,16 @@
 
 ### Go ###
 # Binaries for programs and plugins
+# 
+#
+#
+/mr/todo.md
+/main/mrworker
+/main/mrmaster
+/main/mrsequential
+/main/mr-tmp
+
+
 *.exe
 *.exe~
 *.dll
@@ -86,11 +96,6 @@ tags
 ### VisualStudioCode Patch ###
 # Ignore all local history of files
 .history
-./mr/todo.md
-./main/mrworker
-./main/mrmaster
-./main/mrsequential
-./main/mr-tmp
 
 # End of https://www.gitignore.io/api/go,vim,macos,visualstudiocode
 

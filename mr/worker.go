@@ -54,7 +54,7 @@ func queueForJob() bool {
 	}
 
 	if reply.JobType == MapJob {
-		mapJob()
+		mapJob(reply.FilePath, reply.JobId, reply.ReduceNumber)
 	} else {
 		reduceJob()
 	}
@@ -63,7 +63,8 @@ func queueForJob() bool {
 
 }
 
-func mapJob() {
+func mapJob(FilePath string, jobId int, nReduce int) {
+
 }
 
 func reduceJob() {

@@ -83,7 +83,7 @@ func (m *Master) startMapJob(args *Args, reply *Reply) error {
 	reply.FilePath = m.inProgressTasks[taskNum].file
 	go m.timeout(m.inProgressTasks[taskNum].done, m.inProgressTasks[taskNum].jobId)
 	m.inProgressCount++
-	m.idleTasks = m.idleTasks[:taskNum]
+	m.idleTasks = m.idleTasks[:len(m.idleTasks)-1]
 
 	return nil
 }
@@ -98,10 +98,10 @@ func (m *Master) JobDone(args *Args, reply *Reply) error {
 	if err != nil {
 		return errors.New(fmt.Sprintf("JobDone: Task with id %v doesn't exist.\n", args.JobId))
 	}
+	m.phaseCh <- struct{}{}
 	task.done <- struct{}{}
 	task.jobId = -1
 	m.inProgressCount--
-	m.phaseCh <- struct{}{}
 	m.tasksMux.Unlock()
 	return nil
 }
