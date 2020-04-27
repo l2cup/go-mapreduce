@@ -11,10 +11,12 @@ import (
 	"strconv"
 )
 
+// Args is a struct containing rpc arugments.
 type Args struct {
 	JobId int
 }
 
+// Args is a struct containing rpc reply stuff.
 type Reply struct {
 	ReduceNumber int
 	JobId        int

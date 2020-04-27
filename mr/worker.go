@@ -1,10 +1,15 @@
 package mr
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
+	"os"
+	"sort"
 	"time"
 )
 
@@ -21,56 +26,171 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
+// ihash is a hashing function used to reduce the task number
+// for each KeyValue emitted by Map.
+// Used as ihash(Key) % nReduce
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+// Worker starts a new worker which then queues for a job.
+// If a worker doesn't get a job or a job failes it sleeps for 5 seconds.
+// Workers will shutdown when the master shuts down automatically.
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	for {
+	if call("Master.RegisterWorker", &struct{}{}, &struct{}{}) == false {
+		return
+	}
 
-		if queueForJob() == false {
-			fmt.Printf("Sleeping for 3 secs.\n")
-			time.Sleep(3 * time.Second)
-			break
+	for {
+		if queueForJob(mapf, reducef) == false {
+			time.Sleep(2 * time.Second)
+			shutdown()
 		}
 	}
 }
 
-func queueForJob() bool {
+// queueForJob is a method used to ask the master for a job.
+// It's arguments are the map and reduce function to be used for the given job.
+// Returns a bool. False if there was an error, doesn't return the error.
+func queueForJob(mapf func(string, string) []KeyValue, reducef func(string, []string) string) bool {
 	args := Args{}
 	reply := Reply{}
 
-	// send the RPC request, wait for the reply.
 	ret := call("Master.RequestJob", &args, &reply)
 	if ret == false {
 		return ret
 	}
-
 	if reply.JobType == MapJob {
-		mapJob(reply.FilePath, reply.JobId, reply.ReduceNumber)
+		if err := mapJob(&reply, mapf); err != nil {
+			fmt.Printf("[Worker] queueForJob - map: %v \n", err.Error())
+			return false
+		}
 	} else {
-		reduceJob()
+		if err := reduceJob(&reply, reducef); err != nil {
+			fmt.Printf("[Worker] queueForJob - reduce: %v \n", err.Error())
+			return false
+		}
 	}
-
 	return finishJob(reply.JobId)
 
 }
 
-func mapJob(FilePath string, jobId int, nReduce int) {
+// mapJob is the map part of MapReduce. It takes the map function as an
+// argument and a *Reply. It reads the given file and passes it's content
+// to the map function. It sorts the output and writes it into intermediate
+// files. Returns an error if something goes wrong, otherwise nil.
+func mapJob(reply *Reply, mapf func(string, string) []KeyValue) error {
+
+	content, err := ioutil.ReadFile(reply.FilePath)
+
+	if err != nil {
+		return err
+	}
+
+	intermediate := mapf(reply.FilePath, string(content))
+	sort.Sort(ByKey(intermediate))
+	var files []*os.File
+	var encoders []*json.Encoder
+
+	/* We write to temp files to assure crash protection */
+
+	for i := 0; i < reply.ReduceNumber; i++ {
+		file, err := ioutil.TempFile("./", fmt.Sprintf("mr-%v-%v-", reply.JobId, i))
+		if err != nil {
+			return err
+		}
+		enc := json.NewEncoder(file)
+		encoders = append(encoders, enc)
+		files = append(files, file)
+	}
+
+	for _, kv := range intermediate {
+		fileNum := ihash(kv.Key) % reply.ReduceNumber
+		err := encoders[fileNum].Encode(kv)
+		if err != nil {
+			fmt.Printf("[Worker] Error Encoding : %v", err.Error())
+			return err
+		}
+	}
+	/* When we are done with writing we atomically rename files */
+	for i := 0; i < reply.ReduceNumber; i++ {
+		os.Rename(files[i].Name(), fmt.Sprintf("./mr-%v-%v", reply.JobId, i))
+		files[i].Close()
+	}
+
+	return nil
 
 }
 
-func reduceJob() {
+// reduceJob is the reduce part of MapReduce. It takes the reduce function as an
+// argument and a *Reply. It reads all map files for given reduce job id.
+// sort(k, v) -> sorted(k, v) -> (k, (list(v))) -> reduce(k, (list(v)))
+// Returns an error if something goes wrong, otherwise nil.
+func reduceJob(reply *Reply, reducef func(string, []string) string) error {
 
+	var files []*os.File
+	var decoders []*json.Decoder
+
+	var outputFile, err = ioutil.TempFile("./", fmt.Sprintf("mr-out-%v-", reply.JobId))
+	if err != nil {
+		return errors.New(fmt.Sprintf("Couldn't make output file for reduce job no. %v\n", reply.JobId))
+	}
+
+	for i := 0; ; i++ {
+		file, err := os.Open(fmt.Sprintf("./mr-%v-%v", i, reply.JobId))
+		if err != nil {
+			break
+		}
+		dec := json.NewDecoder(file)
+		files = append(files, file)
+		decoders = append(decoders, dec)
+	}
+
+	var intermediate []KeyValue
+	for i := 0; i < len(files); i++ {
+		for {
+			var kv KeyValue
+			if err := decoders[i].Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+	}
+
+	sort.Sort(ByKey(intermediate))
+
+	for i := 0; i < len(intermediate); {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		fmt.Fprintf(outputFile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	for _, file := range files {
+		file.Close()
+	}
+	os.Rename(outputFile.Name(), fmt.Sprintf("./mr-out-%v", reply.JobId))
+	outputFile.Close()
+
+	return nil
 }
 
+// finishJob is used to notify the master that the worker calling is done with the task.
 func finishJob(jobId int) bool {
 	args := Args{JobId: jobId}
 	reply := Reply{}
@@ -93,4 +213,11 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	}
 	fmt.Println(err)
 	return false
+}
+
+func shutdown() {
+	if call("Master.Shutdown", &struct{}{}, &struct{}{}) == false {
+		fmt.Printf("[Worker] Exiting gracefully\n")
+		os.Exit(1)
+	}
 }
